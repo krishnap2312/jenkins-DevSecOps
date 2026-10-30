@@ -1,0 +1,126 @@
+pipeline {
+    agent any
+    
+    environment {
+        // మీ AWS ECR రిపోజిటరీ URL ఇక్కడ ఇవ్వాలి
+        DOCKER_IMAGE = "123456789012.dkr.ecr.us-east-1.amazonaws.com/java-app"
+        SONAR_CREDENTIALS = credentials('sonar-token')
+        // IMAGE_TAG ని ముందుగా డిక్లేర్ చేయము, Git Checkout స్టేజ్ లో డైనమిక్ గా తీసుకుంటాము
+    }
+    
+    stages {
+        stage('1. Git Checkout') {
+            steps {
+                echo 'Checking out source code from Git...'
+                git branch: 'main', url: 'https://github.com/your-repo/java-app.git'
+                
+                // Git షార్ట్ కమిట్ ID ని క్యాప్చర్ చేసి IMAGE_TAG గా సెట్ చేయడం
+                script {
+                    env.IMAGE_TAG = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                }
+                echo "Git Commit ID used for Docker Tag & S3 Path: ${env.IMAGE_TAG}"
+            }
+        }
+
+        stage('2. SonarQube Analysis & Quality Gate') {
+            steps {
+                echo 'Running Static Application Security Testing (SAST)...'
+                withSonarQubeEnv('SonarQubeServer') {
+                    sh 'mvn clean verify sonar:sonar -Dsonar.login=$SONAR_CREDENTIALS'
+                }
+                
+                echo 'Waiting for SonarQube Quality Gate result...'
+                // కోడ్ క్వాలిటీ ఫెయిల్ అయితే పైప్‌లైన్ ఇక్కడే ఆగిపోతుంది
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('3. Maven Build & OWASP SCA') {
+            steps {
+                echo 'Building Java Application and Checking Dependencies...'
+                // pom.xml లో OWASP ప్లగ్ఇన్ యాడ్ చేశాం కాబట్టి ఇక్కడే వల్నరబిలిటీస్ కూడా చెక్ అవుతాయి
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+
+        stage('4. Manager Approval') {
+            input {
+                message 'Do you approve uploading this artifact to AWS S3 and continuing the deployment?'
+                ok 'Approve & Proceed'
+                // submitter 'admin, manager' // RBAC రోల్స్ ఉంటే ఇలా స్పెసిఫిక్ యూజర్స్ కే అప్రూవల్ పర్మిషన్ ఇవ్వొచ్చు.
+            }
+            steps {
+                echo 'Manager has approved the deployment. Proceeding...'
+            }
+        }
+
+        stage('5. Artifact Upload to AWS S3') {
+            steps {
+                echo 'Uploading Artifact (.jar) to AWS S3 Bucket...'
+                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    // ఆర్టిఫాక్ట్ పాత్ లో కూడా Git Commit ID ని వాడుతున్నాం (Traceability కోసం)
+                    s3Upload(file: 'target/app.jar', bucket: 'my-devsecops-artifacts-bucket', path: "releases/${env.IMAGE_TAG}/app.jar")
+                }
+            }
+        }
+
+        stage('6. Docker Build') {
+            steps {
+                echo 'Building Docker Image...'
+                // Dockerfile కి అనుగుణంగా app.jar ని రూట్ డైరెక్టరీకి కాపీ చేయడం
+                sh 'cp target/app.jar app.jar'
+                // ఇక్కడ Git Commit ID ట్యాగ్ గా యాడ్ అవుతుంది
+                sh "docker build -t ${DOCKER_IMAGE}:${env.IMAGE_TAG} ."
+            }
+        }
+
+        stage('7. Trivy Vulnerability Scan') {
+            steps {
+                echo 'Scanning Docker Image for vulnerabilities...'
+                // ఇమేజ్ స్కాన్ లో హై రిస్క్ వస్తే పైప్‌లైన్ ఫెయిల్ అవుతుంది
+                sh "trivy image --exit-code 1 --severity CRITICAL,HIGH ${DOCKER_IMAGE}:${env.IMAGE_TAG}"
+            }
+        }
+
+        stage('8. Push Docker Image to AWS ECR') {
+            steps {
+                echo 'Pushing secure image to Amazon ECR...'
+                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
+                    sh "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com"
+                    sh "docker push ${DOCKER_IMAGE}:${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('9. Update Git Manifests (Trigger ArgoCD)') {
+            steps {
+                echo 'Updating Kubernetes deployment.yaml with new Git Commit ID...'
+                withCredentials([gitUsernamePassword(credentialsId: 'github-token', gitToolName: 'Default')]) {
+                    sh """
+                        git clone https://github.com/your-repo/k8s-manifests.git
+                        cd k8s-manifests
+                        // పాత ఇమేజ్ ట్యాగ్ ని కొత్త Git Commit ID ట్యాగ్ తో రీప్లేస్ చేయడం
+                        sed -i 's|image: .*|image: ${DOCKER_IMAGE}:${env.IMAGE_TAG}|g' deployment.yaml
+                        git add deployment.yaml
+                        git commit -m "Update image tag to Git Commit ID: ${env.IMAGE_TAG}"
+                        git push origin main
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs() // సెక్యూరిటీ కోసం ప్రతి బిల్డ్ తర్వాత వర్క్‌స్పేస్ ని క్లీన్ చేయడం
+        }
+        success {
+            echo "Pipeline Executed Successfully! ArgoCD will now sync the deployment."
+        }
+        failure {
+            echo "Pipeline Failed. Please check the Jenkins logs."
+        }
+    }
+}
